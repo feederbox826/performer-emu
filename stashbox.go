@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"log"
 	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
@@ -25,17 +26,10 @@ type Performer struct {
 	Images []PerformerImage `json:"images"`
 }
 
-type MeResponse struct {
-	Data struct {
-		Me struct {
-			Name string `json:"name"`
-		} `json:"me"`
-	} `json:"data"`
-}
-
 type RootResponse struct {
-	Endpoint string `json:"endpoint"`
-	APIKey   string `json:"apikey"`
+	Endpoint   string         `json:"endpoint"`
+	APIKey     string         `json:"apikey"`
+	Performers map[string]int `json:"performers"`
 }
 
 type SearchPerformerResponse struct {
@@ -50,32 +44,30 @@ type FindPerformerResponse struct {
 	} `json:"data"`
 }
 
-// init
+var meResponse = []byte(`{"data":{"me":{"name":"anonymous"}}}`)
+var rootResponse []byte
 var (
 	baseURL      string
 	basePath     string
 	endpoint     string
-	file_ext     string
+	fileExt      string
 	performers   []Performer
 	performerMap map[string]string
 )
 
 func main() {
-	// Load environment variables with defaults
 	baseURL = os.Getenv("BASE_URL")
 	basePath = os.Getenv("BASE_PATH")
 	endpoint = os.Getenv("ENDPOINT")
-	file_ext = os.Getenv("FILE_EXT")
-	if file_ext == "" {
-		file_ext = ".webp"
+	fileExt = os.Getenv("FILE_EXT")
+	if fileExt == "" {
+		fileExt = ".webp"
 	}
-	// check if all are defined
 	if baseURL == "" || basePath == "" || endpoint == "" {
 		log.Fatal("BASE_URL, BASE_PATH, and ENDPOINT environment variables must be set")
 	}
 
 	loadImages()
-	responseInit()
 
 	http.HandleFunc("/graphql", graphqlHandler)
 	http.HandleFunc("/", rootHandler)
@@ -85,40 +77,91 @@ func main() {
 	log.Fatal(http.ListenAndServe(":10103", nil))
 }
 
-// load all images recursively
+func samePerformer(name, base string) bool {
+	return name == base || strings.HasPrefix(name, base+" ") || strings.HasPrefix(name, base+" (")
+}
+
+func normalizeName(s string) string {
+	s = strings.ToLower(s)
+	s = strings.ReplaceAll(s, "-", " ")
+	return strings.Join(strings.Fields(s), " ")
+}
+
 func loadImages() {
-	performers = []Performer{}
-	performerMap = make(map[string]string)
-	filepath.WalkDir(basePath, func(path string, d os.DirEntry, err error) error {
+	type image struct {
+		rel, name, url string
+	}
+
+	var files []image
+	var names []string
+
+	err := filepath.WalkDir(basePath, func(path string, d os.DirEntry, err error) error {
 		if err != nil {
 			return err
 		}
-		if !d.IsDir() && strings.HasSuffix(d.Name(), file_ext) {
-			name := strings.TrimSuffix(d.Name(), file_ext)
-			relPath := filepath.ToSlash(path[len(basePath):])
-			url := baseURL + relPath
-			perf := Performer{Name: name, ID: name, Images: []PerformerImage{{URL: url}}}
-			performers = append(performers, perf)
-			performerMap[name] = url
+		if d.IsDir() || !strings.HasSuffix(d.Name(), fileExt) {
+			return nil
+		}
+
+		rel, err := filepath.Rel(basePath, path)
+		if err != nil {
+			return err
+		}
+		rel = filepath.ToSlash(rel)
+		name := strings.TrimSuffix(d.Name(), fileExt)
+		imageURL, err := url.JoinPath(baseURL, rel)
+		if err != nil {
+			return err
+		}
+
+		files = append(files, image{rel, name, imageURL})
+		if dir := filepath.Dir(rel); dir != "." {
+			names = append(names, filepath.Base(dir))
+		} else {
+			names = append(names, name)
 		}
 		return nil
 	})
-}
-
-var meResponse []byte
-var rootResponse []byte
-
-func responseInit() {
-	// set up meResponse
-	meResp := MeResponse{}
-	meResp.Data.Me.Name = "anonymous"
-	meResponse, _ = json.Marshal(meResp)
-	// set up rootResponse
-	rootResp := RootResponse{
-		Endpoint: endpoint,
-		APIKey:   "whatever",
+	if err != nil {
+		log.Fatal(err)
 	}
-	rootResponse, _ = json.Marshal(rootResp)
+
+	groups := map[string][]PerformerImage{}
+	performerMap = map[string]string{}
+	index := map[string]int{}
+
+	for _, f := range files {
+		group := f.name
+		if dir := filepath.Dir(f.rel); dir != "." {
+			group = filepath.Base(dir)
+		} else {
+			for _, n := range names {
+				if samePerformer(f.name, n) && len(n) < len(group) {
+					group = n
+				}
+			}
+		}
+
+		groups[group] = append(groups[group], PerformerImage{URL: f.url})
+		performerMap[f.name] = f.url
+		performerMap[strings.TrimSuffix(f.rel, fileExt)] = f.url
+		if f.name == group || performerMap[group] == "" {
+			performerMap[group] = f.url
+		}
+	}
+
+	performers = make([]Performer, 0, len(groups))
+	for name, images := range groups {
+		performers = append(performers, Performer{Name: name, ID: name, Images: images})
+		index[name] = len(images)
+	}
+
+	rootResponse, _ = json.Marshal(RootResponse{
+		Endpoint:   endpoint,
+		APIKey:     "whatever",
+		Performers: index,
+	})
+	log.Printf("loaded %d performers, %d images", len(performers), len(files))
 }
 
 func graphqlHandler(w http.ResponseWriter, r *http.Request) {
@@ -140,12 +183,15 @@ func graphqlHandler(w http.ResponseWriter, r *http.Request) {
 	case "SearchPerformer":
 		term, _ := req.Variables["term"].(string)
 		matches := []Performer{}
-		termLower := strings.ToLower(term)
-		for _, p := range performers {
-			if strings.HasPrefix(strings.ToLower(p.Name), termLower) {
-				matches = append(matches, p)
+		if term != "" {
+			termNorm := normalizeName(term)
+			for _, p := range performers {
+				if strings.HasPrefix(normalizeName(p.Name), termNorm) {
+					matches = append(matches, p)
+				}
 			}
 		}
+		w.Header().Set("Content-Type", "application/json")
 		resp := SearchPerformerResponse{}
 		resp.Data.SearchPerformer = matches
 		json.NewEncoder(w).Encode(resp)
@@ -157,6 +203,7 @@ func graphqlHandler(w http.ResponseWriter, r *http.Request) {
 		}
 		json.NewEncoder(w).Encode(resp)
 	default:
+		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(map[string]interface{}{"data": map[string]interface{}{}})
 	}
 }
