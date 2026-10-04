@@ -44,6 +44,12 @@ type SearchPerformerResponse struct {
 	} `json:"data"`
 }
 
+type FindPerformerResponse struct {
+	Data struct {
+		FindPerformer *Performer `json:"findPerformer"`
+	} `json:"data"`
+}
+
 // init
 var (
 	baseURL      string
@@ -143,8 +149,15 @@ func graphqlHandler(w http.ResponseWriter, r *http.Request) {
 		resp := SearchPerformerResponse{}
 		resp.Data.SearchPerformer = matches
 		json.NewEncoder(w).Encode(resp)
+	case "FindPerformerByID":
+		id, _ := req.Variables["id"].(string)
+		resp := FindPerformerResponse{}
+		if url, ok := performerMap[id]; ok {
+			resp.Data.FindPerformer = &Performer{Name: id, ID: id, Images: []PerformerImage{{URL: url}}}
+		}
+		json.NewEncoder(w).Encode(resp)
 	default:
-		json.NewEncoder(w).Encode(map[string]interface{}{req.OperationName: map[string]interface{}{}})
+		json.NewEncoder(w).Encode(map[string]interface{}{"data": map[string]interface{}{}})
 	}
 }
 
